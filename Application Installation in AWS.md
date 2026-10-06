@@ -1,0 +1,341 @@
+# Application Installation in AWS
+
+**Object : **  
+Take a simple Java application and deploy it in AWS.  
+You can use:  
+EC2 for the application server  
+Nginx as the web server  
+Tomcat/JBoss for the application  
+RDS MySQL for the database  
+The application should be able to connect to the database.  
+Please create the required VPC, subnets, security groups and IAM roles as part of the setup.
+
+
+## **High level Flow**
+
+`User (80/443) -> Nginx -> App (8080) -> RDS (3306)`
+
+<img width="1920" height="1047" alt="image" src="https://github.com/user-attachments/assets/08dcf2f7-1d90-4642-a9f0-4c77fa2cbc61" />
+
+
+Demo repo - <https://github.com/ananish/Customer-CRUD-App.git> 
+
+## **Infrastructure Setup**
+
+### **VPC**
+
+1. **Name tag:** `prod-vpc`
+2. **IPv4 CIDR:** `10.0.0.0/16`
+3. **No of AZs:** `2`
+4. **No of Public Subnets:** `2`
+5. **No of Private Subnets:** `2`
+6. **NAT Gateways:** Select `In 1 AZ` (to save cost for lab, prod uses 1 per AZ)
+7. **VPC Endpoints:** None 
+8. Keep **Enable DNS hostnames & DNS resolution** checked.
+
+### **Subnets**
+
+- Public 1 -\> `prod-public-1a` for nginx EC2 instance
+- Public 2 -\> `prod-public-1b` empty/HA reserve
+- Private 1 -\> `prod-app-private-1a` Java Spring Boot Application and sharing with DB
+- Private 2 -\> `prod-db-private-1b` - for RDS 2nd AZ
+
+Here DB Group = `private-1a` + `private-1b` = 2 zones 
+
+
+### **Security Groups**
+
+
+1. **nginx-proxy-sg**
+
+- Name: `nginx-proxy-sg`
+- Inbound:
+    - `HTTP 80 : 0.0.0.0/0` To access URL
+    - `HTTPS 443 : 0.0.0.0/0` 
+    - `SSH 22 : YOUR_IP/32` - click `My IP` for remotely login to VM
+- Outbound: All
+
+1. **app-tier-sg**
+
+- Name: `app-tier-sg`
+- Inbound:
+    - `Custom TCP 8080 : Source = nginx-proxy-sg` 
+- Outbound: All
+
+1. ** db-tier-sg**
+
+- Name: `sg-db-tier`
+- Inbound:
+    - `MySQL 3306 : Source = app-tier-sg`
+- Outbound: default.
+
+
+### **EC2 Instances**
+
+**A) App EC2 (Private)** - `prod-app-01`
+
+AMI: **Ubuntu 22.04 LTS**
+
+Type: **t3.small** (2GB RAM for Java)
+
+Subnet : `prod-app-private-1a (10.0.11.0/24)`
+
+ Security Group: Select existing `app-tier-sg`
+
+IAM instance profile: `ec2-app-role` **for Accessing DB without Access key and secret key **
+
+**B) Nginx EC2 (Public)** - `prod-nginx-01`
+
+AMI: **Ubuntu 22.04 LTS**
+
+Type: **t3.micro** 
+
+Subnet : `prod-public-1a`
+
+ Security Group: Select existing `nginx-proxy-sg`
+
+IAM instance profile: `ec2-app-role` **for Accessing DB without Access key and secret key **
+
+🖋️ Note: Allocated Elastic IP after launch
+
+
+### IAM Role
+
+**ec2-app-role **  
+with AmazonSSMManagedInstanceCore, and [CloudWatchAgentServerPolicy](https://us-east-1.console.aws.amazon.com/iam/home?region=ap-south-1#/policies/details/arn%3Aaws%3Aiam%3A%3Aaws%3Apolicy%2FCloudWatchAgentServerPolicy) policy to login without 22 port open and monitoring in CloudWatch 
+
+
+### **RDS **
+
+Database: MySQL
+
+Instance name - prod-db
+
+Database name : customer
+
+
+## Application setup and configuration
+
+**A) On App EC2 **`10.0.11.XX`**: **
+
+**Connect \> Session Manager** (works because of IAM role - no need to open SSH to world).
+
+**Switch to user Ubuntu**
+
+Command - `sudo su - ubuntu`
+
+cd \~
+
+**Update package manager and install  java, git package**
+
+`sudo apt update && sudo apt install openjdk-17-jdk git -y`
+
+`git clone https://github.com/YOUR_USER/YOUR_REPO.git`
+
+sudo chown -R ubuntu:ubuntu \~/Customer-CRUD-App  
+chmod +x \~/Customer-CRUD-App/mvnw
+
+
+`# Edit DB connection`  
+  
+`nano src/main/resources/application.properties`
+
+Add
+
+`# spring.datasource.url=jdbc:mysql://YOUR_RDS_ENDPOINT:3306/prodappdb?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Kolkata# spring.datasource.username=admin# spring.datasource.password=YOUR_RDS_PASSWORD`
+
+
+### Compile and build application
+
+inside your app directory
+
+### `./mvnw clean package -DskipTests`  
+
+**Creating service**
+
+`sudo nano /etc/systemd/system/springboot.service`
+
+🖋️ please enter full name of jar file not wildcard (\*)
+
+\[Unit\]  
+Description=Spring Boot Prod App  
+After=network.target
+
+\[Service\]  
+User=ubuntu  
+WorkingDirectory=/home/ubuntu/Customer-CRUD-App  
+ExecStart=/usr/bin/java -jar /home/ubuntu/Customer-CRUD-App/target/Customer-CRUD-App-0.0.1-SNAPSHOT.jar --server.port=8080  
+Environment=DB\_PASSWORD=Admin12345!  
+Restart=always  
+RestartSec=5
+
+\[Install\]  
+WantedBy=multi-user.target
+
+
+### Run Application and test locally
+
+  
+sudo systemctl daemon-reload  
+sudo systemctl restart springboot  
+sudo systemctl status springboot  
+curl localhost:8080
+
+
+## **Go to Nginx EC2 - **`prod-nginx-01`
+
+login via local ssh
+
+
+sudo apt update && sudo apt install nginx -y
+
+sudo nano /etc/nginx/sites-available/prod-app
+
+Paste - **change private IP to your App EC2 IP **`10.0.140.72`**:**
+
+
+server {  
+    listen 80;  
+    server\_name \_;
+
+location / {  
+    proxy\_pass \<<http://10.0.140.72:8080;>\>  
+    proxy\_set\_header Host $host;  
+    proxy\_set\_header X-Real-IP $remote\_addr;  
+    proxy\_set\_header X-Forwarded-For $proxy\_add\_x\_forwarded\_for;  
+    proxy\_set\_header X-Forwarded-Proto $scheme;  
+}
+
+}
+
+
+### Create link , remove default , test syntax, restart nginx, check status
+
+sudo ln -s /etc/nginx/sites-available/prod-app /etc/nginx/sites-enabled/  
+sudo rm -f /etc/nginx/sites-enabled/default  
+sudo nginx -t  
+sudo systemctl restart nginx  
+sudo systemctl status nginx
+
+1. On Nginx EC2: `curl http://<App Private IP>:8080` - should work
+2. From laptop: `http://YOUR_EIP` (Elastic IP of Nginx) - should show Customer CRUD App!
+
+
+### Troubleshooting Playbook - Where to check
+
+**App not starting:**
+
+sudo systemctl status springboot  
+sudo journalctl -u springboot -n 100 --no-pager  # real error is here  
+ls target/\*.jar  # jar exists?  
+cat src/main/resources/application.properties  # RDS endpoint correct?
+
+
+**DB connection fail:**
+
+mysql -h YOUR\_RDS\_ENDPOINT -u admin -p  # can you connect from App EC2?
+# If timeout = SG issue - sg-rds should allow sg-app-tier
+
+**Nginx 502 Bad Gateway:**
+
+sudo systemctl status nginx
+sudo cat /var/log/nginx/error.log
+curl http://10.0.140.72:8080/api/customers  # from Nginx EC2 - if fails, App EC2 down
+# Check SG: sg-nginx should allow 80 from 0.0.0.0/0, sg-app should allow 8080 from sg-nginx
+
+### **Chanllages**
+
+1. DB can not be create as MZ
+2. Git clone worked with with root user , need to change ownership to normal user
+3. application pointing to localhost inside backend logic, replaced localhost form the js, and html code
+
+cd \~/Customer-CRUD-App  
+grep -r "localhost:8080" --include="*.js" --include="*.html" .
+
+The following command replaces occurrences of `http://localhost:8080` with an empty string in matching files.
+
+```
+sed -i 's|http://localhost:8080||g' src/main/resources/static/*.js src/main/resources/static/*.html
+# or manually edit with nano
+```
+
+
+1. App instance was not allowing to login using session manager due to port 22 , created role with required policy to access it via ssm
+
+
+
+
+
+# **Additional**
+
+
+###  Best for AWS Free Tier - SSM Parameter Store (FREE)
+
+**Create secret:**  
+AWS Console \> Systems Manager \> Parameter Store \> Create parameter
+
+- Name: `/prod/prodappdb/password`
+- Type: `SecureString`
+- Value: `Admin12345!`
+
+Give App EC2 role permission to read it. Create IAM Role `ec2-ssm-role` with policy `AmazonSSMReadOnlyAccess` and attach to App EC2.
+
+**Spring Boot read it:**
+
+XML
+
+```xml
+<dependency>  <groupId>io.awspring.cloud</groupId>  <artifactId>spring-cloud-starter-aws-parameter-store-config</artifactId></dependency>
+```
+
+properties
+
+```properties
+spring.config.import=【entity-aws¦canonical_name=AWS】-parameterstore:/prod/prodappdb/spring.datasource.password=${password}
+```
+
+
+**Need REBUILD + RESTART:**
+
+- `src/main/resources/application.properties`
+- `src/main/resources/static/*.js` / `*.html`
+- Any Java code / `CorsConfig.java`
+
+Bash
+
+```bash
+./mvnw clean package -DskipTests
+sudo systemctl restart springboot
+```
+
+**Need ONLY RESTART (no build):**
+
+- `/etc/systemd/system/springboot.service` (you changed `Environment=` or `EnvironmentFile=`)
+- `/etc/springboot.env` (if you use that method)
+
+Bash
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart springboot
+```
+
+### Pro tip to avoid rebuild for config:
+
+Put `application.properties` outside JAR:
+
+Bash
+
+```bash
+mkdir ~/configcp ~/Customer-CRUD-App/src/main/resources/application.properties ~/config/# Edit ~/config/application.properties there
+```
+
+Then change service to:
+
+Code
+
+```
+ExecStart=/usr/bin/java -jar /path/to.jar --spring.config.additional-location=/home/ubuntu/config/application.properties --server.port=8080
+```
+
+Now you can change DB password / URL in `~/config/application.properties` and just `restart` - no build needed.
